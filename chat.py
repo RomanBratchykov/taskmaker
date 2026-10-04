@@ -1,741 +1,751 @@
 #!/usr/bin/env python3
+"""
+chat.py – Terminal agent with tool use.
+Backends: Ollama (streaming, think mode) and Bonsai 27B (OpenAI-compatible).
 
+Usage:
+    python chat.py [--backend ollama|bonsai] [--model <name>]
 
-"""Terminal chat for Ollama — smart orchestrator with context management.
-
-Features:
-  • Real-time context tracking + automatic compression when near limit
-  • Compressed snapshots saved to temp files for audit/recovery
-  • Rich tool-set tuned for 4 B-parameter models (short, explicit schemas)
-  • Web search via DuckDuckGo HTML scrape — no API key needed
-  • Skill loader: reads ./skills/**/*.md and injects them into system prompt
-  • OS-safety layer: blocks dangerous shell patterns, mandatory confirmation
-
-Setup:  pip install ollama requests lxml
-Run:    python chat.py [--model qwen3:4b] [--ctx 8192]
-
-Commands (at the > prompt):
-  /model <name>   switch active model
-  /think          toggle chain-of-thought
-  /reset          clear history (keeps system prompt)
-  /compress       manually compress now
-  /skills         list loaded skills
-  /help           show commands
-  /exit
+Slash commands:
+    /backend ollama|bonsai   Switch backend mid-conversation
+    /model <name>            Switch model
+    /think                   Toggle thinking mode (Ollama only)
+    /reset                   Clear conversation history
+    /status                  Show current config + server health
+    /stop                    Stop Bonsai server (if this script started it)
+    /exit  or  Ctrl-D        Exit
+    /help                    Show this message
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
-import pathlib
-import re
 import subprocess
 import sys
-import tempfile
-import textwrap
 import time
 import traceback
-from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
-import ollama
+# ─── ANSI colours ─────────────────────────────────────────────────────────────
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+RED     = "\033[31m"
+MAGENTA = "\033[35m"
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-DEFAULT_MODEL = "qwen3:4b"
-HELPERS: dict[str, str] = {
-    "coder":   "qwen2.5-coder:3b",
-    "fast":    "qwen3:1.7b",
-    "general": "gemma3:4b",
-}
-DEFAULT_CTX  = 8192          # tokens Ollama reserves per session
-CTX_WARN     = 0.80          # compress when used tokens > 80 % of limit
-CTX_CRITICAL = 0.92          # hard-compress: drop oldest non-system turns
-MAX_STEPS    = 10            # max tool rounds per user message
-MAX_OUT      = 3000          # max chars returned by any single tool
-WORKDIR      = pathlib.Path.cwd().resolve()
-SKILLS_DIR   = WORKDIR / "skills"
-COMPRESS_DIR = pathlib.Path(tempfile.gettempdir()) / "chat_compress"
-COMPRESS_DIR.mkdir(exist_ok=True)
+def cprint(color: str, text: str, end: str = "\n") -> None:
+    print(f"{color}{text}{RESET}", end=end, flush=True)
 
-# ---------------------------------------------------------------------------
-# ANSI helpers
-# ---------------------------------------------------------------------------
-DIM   = "\033[2m"
-BOLD  = "\033[1m"
-CYAN  = "\033[36m"
-YELLOW = "\033[33m"
-RED   = "\033[31m"
-RESET = "\033[0m"
+# ─── Tool JSON schemas ────────────────────────────────────────────────────────
 
-def dim(s: str)    -> str: return f"{DIM}{s}{RESET}"
-def bold(s: str)   -> str: return f"{BOLD}{s}{RESET}"
-def cyan(s: str)   -> str: return f"{CYAN}{s}{RESET}"
-def yellow(s: str) -> str: return f"{YELLOW}{s}{RESET}"
-def red(s: str)    -> str: return f"{RED}{s}{RESET}"
+def _schema(name: str, description: str, props: dict, required: list[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": props, "required": required},
+        },
+    }
 
-
-# ---------------------------------------------------------------------------
-# Skills loader
-# ---------------------------------------------------------------------------
-_LOADED_SKILLS: dict[str, str] = {}
-
-def load_skills() -> str:
-    """Scan SKILLS_DIR for *.md files, return concatenated skill text."""
-    global _LOADED_SKILLS
-    _LOADED_SKILLS = {}
-    if not SKILLS_DIR.is_dir():
-        return ""
-    for md in sorted(SKILLS_DIR.rglob("*.md")):
-        name = md.stem
-        try:
-            text = md.read_text(errors="replace")[:2000]
-            _LOADED_SKILLS[name] = text
-        except Exception:
-            pass
-    if not _LOADED_SKILLS:
-        return ""
-    parts = [f"## Skill: {n}\n{t}" for n, t in _LOADED_SKILLS.items()]
-    return "\n\n---\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# OS-safety layer
-# ---------------------------------------------------------------------------
-# Patterns that are blocked outright (never sent to model either)
-_BLOCKED_PATTERNS = [
-    r"rm\s+-rf\s+/",           # wipe root
-    r"dd\s+if=.*of=/dev/",     # write to raw device
-    r"mkfs\.",                  # format filesystem
-    r">\s*/dev/sd[a-z]",       # overwrite block device
-    r"chmod\s+-R\s+777\s+/",   # chmod root recursively
-    r"shutdown|reboot|halt|poweroff",
-    r":()\{.*\};:",             # fork bomb
-    r"curl.*\|.*sh",           # curl-pipe-sh
-    r"wget.*\|.*sh",
-    r"base64.*\|.*bash",
-    r"/etc/passwd",
-    r"/etc/shadow",
-    r"sudo\s+rm",
+TOOLS = [
+    _schema(
+        "list_dir",
+        "List files and directories at a path. Path must stay inside the working directory.",
+        {"path": {"type": "string", "description": "Relative path to list. Use '.' for CWD."}},
+        ["path"],
+    ),
+    _schema(
+        "read_file",
+        "Read the contents of a file. Path must stay inside the working directory.",
+        {"path": {"type": "string", "description": "Relative path to the file."}},
+        ["path"],
+    ),
+    _schema(
+        "write_file",
+        "Write content to a file (asks confirmation). Path must stay inside the working directory.",
+        {
+            "path":    {"type": "string", "description": "Relative path to write."},
+            "content": {"type": "string", "description": "Content to write."},
+        },
+        ["path", "content"],
+    ),
+    _schema(
+        "run_shell",
+        "Run a shell command (asks confirmation). Timeout: 30 s.",
+        {"command": {"type": "string", "description": "Shell command to execute."}},
+        ["command"],
+    ),
+    _schema(
+        "delegate",
+        "Delegate a sub-task to a named role (planner, coder, reviewer, …).",
+        {
+            "role": {"type": "string", "description": "Role name for the sub-agent."},
+            "task": {"type": "string", "description": "Task description."},
+        },
+        ["role", "task"],
+    ),
 ]
-_BLOCKED_RE = re.compile("|".join(_BLOCKED_PATTERNS), re.IGNORECASE)
 
-_SUSPICIOUS_PATTERNS = [
-    r"\brm\b.*-[rf]",
-    r"\bmv\b.*\s+/",
-    r"\bkill\b",
-    r"\bpkill\b",
-    r"\bchmod\b",
-    r"\bchown\b",
-    r"\bcrontab\b",
-    r"\bnohup\b",
-    r"\b&\s*$",   # background job
-    r"\bsudo\b",
-]
-_SUSPICIOUS_RE = re.compile("|".join(_SUSPICIOUS_PATTERNS), re.IGNORECASE)
+# ─── Safety + file sandbox ────────────────────────────────────────────────────
+CWD = Path.cwd().resolve()
 
-
-def check_command_safety(cmd: str) -> tuple[bool, str]:
-    """Return (is_safe, reason). Blocked commands are never safe."""
-    if _BLOCKED_RE.search(cmd):
-        return False, "BLOCKED: command matches a permanently disallowed pattern"
-    if _SUSPICIOUS_RE.search(cmd):
-        return True, "SUSPICIOUS"  # still requires user confirmation
-    return True, "OK"
-
-
-def confirm(action: str, default_deny: bool = True) -> bool:
-    prompt_hint = "[y/N]" if default_deny else "[Y/n]"
-    try:
-        ans = input(f"{yellow(f'Allow {action}?')} {dim(prompt_hint)} ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return ans == "y" if default_deny else ans != "n"
-
-
-# ---------------------------------------------------------------------------
-# Path safety
-# ---------------------------------------------------------------------------
-def safe_path(path: str) -> pathlib.Path:
-    p = (WORKDIR / path).expanduser().resolve()
-    if p != WORKDIR and WORKDIR not in p.parents:
-        raise ValueError(f"path '{p}' is outside working directory '{WORKDIR}'")
+def _safe_path(rel: str) -> Path:
+    p = (CWD / rel).resolve()
+    if not str(p).startswith(str(CWD)):
+        raise PermissionError(f"Path '{rel}' escapes the working directory.")
     return p
 
-
-# ---------------------------------------------------------------------------
-# Context token estimation
-# ---------------------------------------------------------------------------
-def estimate_tokens(text: str) -> int:
-    """Fast token estimator: ~1 token per 3.5 chars."""
-    return max(1, len(text) // 4)
-
-
-def msgs_token_count(msgs: list[dict]) -> int:
-    total = 0
-    for m in msgs:
-        total += estimate_tokens(m.get("content") or "")
-        for tc in (m.get("tool_calls") or []):
-            total += estimate_tokens(json.dumps(tc))
-    return total
-
-
-# ---------------------------------------------------------------------------
-# Context compression
-# ---------------------------------------------------------------------------
-def _snapshot_to_file(msgs: list[dict]) -> pathlib.Path:
-    """Save current messages to a compressed JSON temp file."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    h  = hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
-    fp = COMPRESS_DIR / f"ctx_{ts}_{h}.json"
-    fp.write_text(json.dumps(msgs, ensure_ascii=False, indent=2))
-    return fp
-
-
-def summarise_with_model(model: str, text: str, num_ctx: int) -> str:
-    """Ask the model for a concise summary (used during compression)."""
-    prompt = (
-        "Summarise the following conversation excerpt into a compact paragraph "
-        "preserving all important facts, decisions, file names, and code snippets. "
-        "Be extremely concise.\n\n" + text[:6000]
-    )
+def _confirm(prompt: str) -> bool:
     try:
-        r = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"num_ctx": num_ctx},
-        )
-        return r.message.content.strip()
-    except Exception as e:
-        # fallback: truncate
-        return text[:1500] + f"\n[...compressed, summarisation failed: {e}]"
+        return input(f"{YELLOW}{prompt} [y/N]{RESET} ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+# ─── Tool implementations ──────────────────────────────────────────────────────
+
+def tool_list_dir(path: str) -> str:
+    try:
+        p = _safe_path(path)
+        if not p.exists():
+            return f"Error: does not exist: {path}"
+        if p.is_file():
+            return f"'{path}' is a file, not a directory."
+        entries = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name))
+        lines = [
+            f"{'📁' if e.is_dir() else '📄'} {e.name}"
+            + (f"  ({e.stat().st_size:,} B)" if e.is_file() else "")
+            for e in entries
+        ]
+        return "\n".join(lines) if lines else "(empty directory)"
+    except PermissionError as exc:
+        return f"Permission error: {exc}"
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
-def compress_context(
-    msgs: list[dict],
-    model: str,
-    num_ctx: int,
-    keep_last_n: int = 4,
-) -> list[dict]:
-    """
-    Compress context:
-    1. Save snapshot to temp file.
-    2. Summarise the middle portion (between system msg and last N turns).
-    3. Return new shorter message list.
-    """
-    snapshot_path = _snapshot_to_file(msgs)
-    print(dim(f"[context] snapshot → {snapshot_path}"))
-
-    system_msgs = [m for m in msgs if m.get("role") == "system"]
-    non_system  = [m for m in msgs if m.get("role") != "system"]
-
-    if len(non_system) <= keep_last_n:
-        # nothing meaningful to compress
-        return msgs
-
-    to_compress = non_system[:-keep_last_n]
-    keep        = non_system[-keep_last_n:]
-
-    # Build a readable block for summarisation
-    excerpt_lines = []
-    for m in to_compress:
-        role    = m.get("role", "?")
-        content = m.get("content") or ""
-        excerpt_lines.append(f"[{role}]: {content[:800]}")
-    excerpt = "\n".join(excerpt_lines)
-
-    print(dim(f"[context] compressing {len(to_compress)} turns → summary …"))
-    summary = summarise_with_model(model, excerpt, num_ctx)
-
-    summary_msg = {
-        "role": "system",
-        "content": (
-            f"[COMPRESSED HISTORY — full log in {snapshot_path}]\n{summary}"
-        ),
-    }
-
-    new_msgs = system_msgs + [summary_msg] + keep
-    saved = msgs_token_count(msgs) - msgs_token_count(new_msgs)
-    print(dim(f"[context] freed ~{saved} tokens"))
-    return new_msgs
+def tool_read_file(path: str) -> str:
+    try:
+        p = _safe_path(path)
+        if not p.exists():
+            return f"Error: not found: {path}"
+        if not p.is_file():
+            return f"Error: '{path}' is not a file."
+        text = p.read_text(errors="replace")
+        if len(text) > 20_000:
+            text = text[:20_000] + "\n\n[…truncated at 20 000 chars…]"
+        return text
+    except PermissionError as exc:
+        return f"Permission error: {exc}"
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
-def maybe_compress(msgs: list[dict], model: str, num_ctx: int) -> list[dict]:
-    """Check token budget and compress if needed."""
-    used  = msgs_token_count(msgs)
-    ratio = used / num_ctx
-    if ratio >= CTX_CRITICAL:
-        print(yellow(f"[context] CRITICAL {ratio:.0%} used — compressing now"))
-        return compress_context(msgs, model, num_ctx, keep_last_n=2)
-    if ratio >= CTX_WARN:
-        print(dim(f"[context] {ratio:.0%} used — soft-compressing"))
-        return compress_context(msgs, model, num_ctx, keep_last_n=6)
-    return msgs
+def tool_write_file(path: str, content: str) -> str:
+    try:
+        p = _safe_path(path)
+        action = "overwrite" if p.exists() else "create"
+        cprint(YELLOW, f"[write_file] About to {action} '{path}' ({len(content):,} chars)")
+        if not _confirm("Proceed?"):
+            return "Write cancelled by user."
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        return f"Written {len(content):,} chars to '{path}'."
+    except PermissionError as exc:
+        return f"Permission error: {exc}"
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-def list_dir(path: str = ".") -> str:
-    """List files and folders in a directory.
-
-    Args:
-        path: Directory path relative to working directory. Default is '.'.
-    """
-    items = sorted(safe_path(path).iterdir())
-    lines = [f"{i.name}{'/' if i.is_dir() else ''}" for i in items]
-    return "\n".join(lines)[:MAX_OUT]
-
-
-def read_file(path: str, start_line: int = 1, end_line: int = 0) -> str:
-    """Read text file content, optionally a line range.
-
-    Args:
-        path: File path relative to working directory.
-        start_line: First line to return (1-based, default 1).
-        end_line: Last line to return inclusive (0 = all remaining).
-    """
-    text = safe_path(path).read_text(errors="replace")
-    if start_line > 1 or end_line:
-        lines = text.splitlines()
-        sl = max(0, start_line - 1)
-        el = end_line if end_line else len(lines)
-        text = "\n".join(lines[sl:el])
-    return text[:MAX_OUT]
-
-
-def write_file(path: str, content: str) -> str:
-    """Write text to a file (replaces file). Requires user confirmation.
-
-    Args:
-        path: File path relative to working directory.
-        content: Full new file content.
-    """
-    p = safe_path(path)
-    if not confirm(f"write {len(content)} chars → {p}"):
-        return "Denied by user."
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content)
-    return f"OK: wrote {p} ({len(content)} chars)"
-
-
-def append_file(path: str, content: str) -> str:
-    """Append text to a file. Requires user confirmation.
-
-    Args:
-        path: File path relative to working directory.
-        content: Text to append.
-    """
-    p = safe_path(path)
-    if not confirm(f"append {len(content)} chars → {p}"):
-        return "Denied by user."
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as f:
-        f.write(content)
-    return f"OK: appended {len(content)} chars to {p}"
-
-
-def run_shell(command: str) -> str:
-    """Run a safe shell command and return output. Requires confirmation.
-
-    Args:
-        command: Shell command. Must not modify the OS or installed software.
-    """
-    ok, reason = check_command_safety(command)
-    if not ok:
-        return f"Error: {reason}"
-    warning = f" ⚠ {reason}" if reason != "OK" else ""
-    if not confirm(f"shell{warning}: {command}"):
-        return "Denied by user."
+def tool_run_shell(command: str) -> str:
+    cprint(YELLOW, f"[run_shell] $ {command}")
+    if not _confirm("Run this command?"):
+        return "Command cancelled by user."
     try:
         r = subprocess.run(
-            command, shell=True, capture_output=True, text=True,
-            timeout=60, cwd=WORKDIR,
+            command, shell=True, capture_output=True,
+            text=True, timeout=30, cwd=str(CWD),
         )
-        out = f"exit={r.returncode}\n{r.stdout}{r.stderr}"
-        return out[:MAX_OUT]
+        out = r.stdout[:8000] + ("\n[stdout truncated]" if len(r.stdout) > 8000 else "")
+        err = r.stderr[:2000] + ("\n[stderr truncated]" if len(r.stderr) > 2000 else "")
+        parts = []
+        if out.strip(): parts.append(f"stdout:\n{out}")
+        if err.strip(): parts.append(f"stderr:\n{err}")
+        parts.append(f"exit code: {r.returncode}")
+        return "\n".join(parts)
     except subprocess.TimeoutExpired:
-        return "Error: command timed out after 60 s"
-    except MemoryError:
-        return "Error: command produced too much output (MemoryError)"
-    except Exception as e:
-        return f"Error: {type(e).__name__}: {e}"
+        return "Error: timed out after 30 s."
+    except Exception as exc:
+        return f"Error: {exc}"
 
 
-def search_web(query: str, max_results: int = 5) -> str:
-    """Search the internet via DuckDuckGo and return concise results.
-
-    Args:
-        query: Search terms.
-        max_results: How many results to return (1–10, default 5).
-    """
-    import urllib.parse
-    import urllib.request
-    from lxml import html as lxml_html
-
-    max_results = max(1, min(10, max_results))
-    q = urllib.parse.quote_plus(query)
-    url = f"https://html.duckduckgo.com/html/?q={q}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        req  = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=10)
-        body = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"Search error: {e}"
-
-    try:
-        tree    = lxml_html.fromstring(body)
-        results = tree.cssselect(".result__body") or tree.cssselect(".result")
-        lines   = []
-        for res in results[:max_results]:
-            title_el  = res.cssselect(".result__title a") or res.cssselect("a")
-            snippet_el = res.cssselect(".result__snippet") or res.cssselect(".snippet")
-            title   = title_el[0].text_content().strip()  if title_el   else "(no title)"
-            snippet = snippet_el[0].text_content().strip() if snippet_el else ""
-            href    = title_el[0].get("href", "") if title_el else ""
-            # DDG wraps links — extract real URL
-            if "uddg=" in href:
-                href = urllib.parse.unquote(href.split("uddg=")[-1].split("&")[0])
-            lines.append(f"• {title}\n  {href}\n  {snippet[:300]}")
-        return ("\n\n".join(lines) or "No results found.")[:MAX_OUT]
-    except Exception as e:
-        return f"Parse error: {e}\nRaw (first 500):\n{body[:500]}"
+def tool_delegate(role: str, task: str) -> str:
+    return (
+        f"[delegate → {role}] Task:\n{task}\n\n"
+        "Proceed step by step using the available tools."
+    )
 
 
-def fetch_page(url: str) -> str:
-    """Fetch a web page and return its main text content (no JS).
-
-    Args:
-        url: Full URL starting with http:// or https://.
-    """
-    import urllib.request
-    from lxml import html as lxml_html
-
-    if not url.startswith(("http://", "https://")):
-        return "Error: URL must start with http:// or https://"
-    try:
-        req  = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; chatpy/1.0)"},
-        )
-        resp = urllib.request.urlopen(req, timeout=15)
-        body = resp.read(200_000).decode("utf-8", errors="replace")
-    except MemoryError:
-        return "Error: page too large (MemoryError)"
-    except Exception as e:
-        return f"Fetch error: {e}"
-
-    try:
-        tree = lxml_html.fromstring(body)
-        # Remove script / style noise
-        for bad in tree.cssselect("script, style, nav, footer, header"):
-            bad.drop_tree()
-        text = tree.text_content()
-        # Collapse whitespace
-        text = re.sub(r"\n{3,}", "\n\n", text.strip())
-        return text[:MAX_OUT]
-    except Exception:
-        # Fallback: strip HTML tags with regex
-        text = re.sub(r"<[^>]+>", "", body)
-        return text[:MAX_OUT]
-
-
-def delegate(role: str, task: str) -> str:
-    """Send a task to a specialist model and return its response.
-
-    Args:
-        role: One of 'coder' (code tasks), 'fast' (quick lookups), 'general' (text/analysis).
-        task: Complete self-contained task description with all needed context.
-    """
-    model = HELPERS.get(role)
-    if not model:
-        return f"Unknown role '{role}'. Available: {', '.join(HELPERS)}"
-    print(dim(f"[delegate → {model}]"))
-    try:
-        r = ollama.chat(
-            model=model,
-            messages=[{"role": "user", "content": task}],
-            options={"num_ctx": _CTX},
-        )
-        return (r.message.content or "")[:MAX_OUT]
-    except ollama.ResponseError as e:
-        return f"Delegate error ({model}): {e}"
-
-
-def read_skill(name: str) -> str:
-    """Return the raw content of a loaded skill by name.
-
-    Args:
-        name: Skill name as shown by /skills command.
-    """
-    text = _LOADED_SKILLS.get(name)
-    if text is None:
-        avail = ", ".join(_LOADED_SKILLS) or "(none)"
-        return f"Skill '{name}' not found. Available: {avail}"
-    return text[:MAX_OUT]
-
-
-TOOLS = {
-    f.__name__: f
-    for f in (list_dir, read_file, write_file, append_file,
-               run_shell, search_web, fetch_page, delegate, read_skill)
+TOOL_FN = {
+    "list_dir":  tool_list_dir,
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "run_shell": tool_run_shell,
+    "delegate":  tool_delegate,
 }
 
 
-# ---------------------------------------------------------------------------
-# System prompt factory
-# ---------------------------------------------------------------------------
-def build_system(skills_text: str) -> str:
-    base = textwrap.dedent(f"""\
-        You are a local terminal assistant running on Ollama.
-        Working directory: {WORKDIR}
-        Current time: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-        Rules:
-        - Use tools when you need real data — never invent file contents or command output.
-        - Prefer short, specific tool calls; do not chain more than 3 per reply.
-        - For substantial code, use delegate(role='coder').
-        - For quick factual answers, use delegate(role='fast').
-        - For internet queries, use search_web() then fetch_page() if you need page content.
-        - Be concise; the user reads in a terminal.
-        - NEVER suggest commands that alter system software, users, or device files.
-    """)
-    if skills_text:
-        base += f"\n\n# Loaded Skills\n{skills_text}"
-    return base
-
-
-# ---------------------------------------------------------------------------
-# Chat engine
-# ---------------------------------------------------------------------------
-_CTX: int = DEFAULT_CTX
-
-
-def stream_reply(model: str, msgs: list, think: bool) -> tuple[str, list]:
-    """Stream one model turn. Returns (text, tool_calls)."""
-    text, calls, in_think = "", [], False
-    try:
-        stream = ollama.chat(
-            model=model,
-            messages=msgs,
-            tools=list(TOOLS.values()),
-            think=think,
-            stream=True,
-            options={"num_ctx": _CTX},
-        )
-        for chunk in stream:
-            m = chunk.message
-            if m.thinking:
-                if not in_think:
-                    print(dim("‹think›"), end=" ", flush=True)
-                    in_think = True
-                print(dim(m.thinking), end="", flush=True)
-            if m.content:
-                if in_think:
-                    print(f"\n{dim('‹/think›')}")
-                    in_think = False
-                text += m.content
-                print(m.content, end="", flush=True)
-            if m.tool_calls:
-                calls.extend(m.tool_calls)
-    except MemoryError:
-        print(red("\n[MemoryError during stream — context may be too large]"))
-    except ollama.ResponseError as e:
-        print(red(f"\n[Ollama error: {e}]"))
-        raise
-    finally:
-        if in_think:
-            print()
-    print()
-    return text, calls
-
-
-def run_tool(call: Any) -> str:
-    name = call.function.name
-    args = call.function.arguments or {}
-    print(dim(f"  ↳ {name}({', '.join(f'{k}={v!r}' for k,v in args.items())})"))
-    fn = TOOLS.get(name)
-    if not fn:
+def dispatch_tool(name: str, arguments: str | dict) -> str:
+    if name not in TOOL_FN:
         return f"Unknown tool: {name}"
+    if isinstance(arguments, str):
+        try:
+            args = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            return f"Tool error: invalid JSON for '{name}': {exc}"
+    else:
+        args = arguments
     try:
-        result = str(fn(**args))
-        # Guard against absurdly large tool results
-        if len(result) > MAX_OUT:
-            result = result[:MAX_OUT] + "\n[...truncated]"
-        return result
-    except MemoryError:
-        return "Error: MemoryError — tool produced too much data"
-    except ValueError as e:
-        return f"Error: {e}"
-    except Exception as e:
-        return f"Error: {type(e).__name__}: {e}"
+        return TOOL_FN[name](**args)
+    except TypeError as exc:
+        return f"Tool error ({name}): bad arguments – {exc}"
+    except Exception as exc:
+        return f"Tool error ({name}): {exc}"
+
+# ─── Neutral history helpers ──────────────────────────────────────────────────
+
+def make_msg(role: str, content: str = "", **kw) -> dict:
+    m: dict[str, Any] = {"role": role, "content": content}
+    m.update(kw)
+    return m
+
+# ─── Bonsai server management ──────────────────────────────────────────────────
+BONSAI_PORT    = 8080
+BONSAI_BASE    = f"http://127.0.0.1:{BONSAI_PORT}/v1"
+BONSAI_LOG     = Path.home() / ".bonsai-server.log"
+BONSAI_DIR     = Path.home() / "Bonsai-demo"
+_bonsai_proc: Optional[subprocess.Popen] = None   # only set if we started it
 
 
-def turn(model: str, msgs: list[dict], think: bool, num_ctx: int) -> list[dict]:
-    """Run one full user-turn (with tool loops). Returns updated msgs."""
-    for step in range(MAX_STEPS):
-        # Compress before each step if needed
-        msgs = maybe_compress(msgs, model, num_ctx)
-
-        text, calls = stream_reply(model, msgs, think)
-        msgs.append({
-            "role": "assistant",
-            "content": text,
-            "tool_calls": calls or None,
-        })
-        if not calls:
-            return msgs
-
-        for c in calls:
-            result = run_tool(c)
-            msgs.append({
-                "role": "tool",
-                "tool_name": c.function.name,
-                "content": result,
-            })
-
-    print(dim(f"[stopped: {MAX_STEPS} tool rounds reached]"))
-    return msgs
-
-
-def supports_tools(model: str) -> bool:
+def _http_get(url: str, timeout: int = 3) -> Optional[bytes]:
     try:
-        caps = ollama.show(model).capabilities or []
-        return "tools" in caps
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read()
     except Exception:
-        return True   # optimistic default
+        return None
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def print_help():
-    print(cyan(textwrap.dedent("""\
-        Commands:
-          /model <name>    switch active model
-          /think           toggle chain-of-thought (thinking tokens)
-          /reset           clear history (keep system prompt)
-          /compress        compress context now and save snapshot
-          /skills          list loaded skills
-          /ctx             show current context token usage
-          /help            this message
-          /exit            quit
-    """)))
+def bonsai_is_up() -> bool:
+    return _http_get(f"{BONSAI_BASE}/models") is not None
 
 
-def main() -> None:
-    global _CTX
+def bonsai_model_name() -> Optional[str]:
+    raw = _http_get(f"{BONSAI_BASE}/models", timeout=5)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data["data"][0]["id"] if data.get("data") else None
+    except Exception:
+        return None
 
-    parser = argparse.ArgumentParser(description="Ollama chat orchestrator")
-    parser.add_argument("--model",  default=DEFAULT_MODEL)
-    parser.add_argument("--ctx",    type=int, default=DEFAULT_CTX)
-    parser.add_argument("--think",  action="store_true")
-    args = parser.parse_args()
 
-    _CTX  = args.ctx
-    model = args.model
-    think = args.think
+def _unload_ollama_models() -> None:
+    """Ask Ollama to unload all running models to free VRAM."""
+    raw = _http_get("http://127.0.0.1:11434/api/ps")
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+        import urllib.request
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            if not name:
+                continue
+            payload = json.dumps({"model": name, "keep_alive": 0}).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:11434/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(req, timeout=10)
+            except Exception:
+                pass
+        cprint(DIM, "Ollama models unloaded from VRAM.")
+    except Exception:
+        pass
 
-    # Load skills
-    skills_text = load_skills()
-    if skills_text:
-        print(dim(f"[skills] loaded: {', '.join(_LOADED_SKILLS)}"))
 
-    system = build_system(skills_text)
-    msgs: list[dict] = [{"role": "system", "content": system}]
+def start_bonsai(ctx_size: Optional[int] = None) -> bool:
+    global _bonsai_proc
+    if bonsai_is_up():
+        cprint(GREEN, "Bonsai server already running.")
+        return True
 
-    if not supports_tools(model):
-        print(yellow(f"[warn] {model} does not report 'tools' capability — continuing anyway"))
+    launcher = BONSAI_DIR / "scripts" / "start_llama_server.sh"
+    if not launcher.exists():
+        cprint(RED, f"Bonsai launcher not found: {launcher}")
+        cprint(RED, "Run setup.sh first (it clones Bonsai-demo and downloads the model).")
+        return False
 
-    print(bold(cyan("Ollama chat")) + f"  model={model}  ctx={_CTX}  think={think}")
-    print(dim("Type /help for commands\n"))
+    _unload_ollama_models()
+
+    env = os.environ.copy()
+    env.update({
+        "BONSAI_FAMILY":           "bonsai",
+        "BONSAI_MODEL":            "27B",
+        "BONSAI_OPENWEBUI":        "0",
+        "BONSAI_CODE_INTERPRETER": "0",
+    })
+    if ctx_size:
+        env["BONSAI_CTX"] = str(ctx_size)
+
+    cprint(CYAN, f"Starting Bonsai server (log → {BONSAI_LOG}) …")
+    log_fh = BONSAI_LOG.open("w")
+    _bonsai_proc = subprocess.Popen(
+        ["bash", str(launcher)],
+        env=env, stdout=log_fh, stderr=subprocess.STDOUT,
+        cwd=str(BONSAI_DIR),
+    )
+
+    for i in range(240):
+        if _bonsai_proc.poll() is not None:
+            cprint(RED, f"Bonsai server exited early (code {_bonsai_proc.returncode}). "
+                        f"See {BONSAI_LOG}")
+            return False
+        if bonsai_is_up():
+            cprint(GREEN, f"Bonsai server up after {i+1} s  [{BONSAI_BASE}]")
+            return True
+        time.sleep(1)
+        if i % 30 == 29:
+            cprint(YELLOW, f"  …waiting for Bonsai ({i+1}/240 s)")
+
+    cprint(RED, f"Bonsai did not respond in 240 s. See {BONSAI_LOG}")
+    return False
+
+
+def stop_bonsai() -> None:
+    global _bonsai_proc
+    if _bonsai_proc is None:
+        return
+    cprint(YELLOW, "Stopping Bonsai server …")
+    _bonsai_proc.terminate()
+    try:
+        _bonsai_proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _bonsai_proc.kill()
+    _bonsai_proc = None
+    cprint(GREEN, "Bonsai server stopped.")
+
+# ─── History conversion ───────────────────────────────────────────────────────
+
+def _to_ollama_msgs(history: list[dict]) -> list[dict]:
+    out = []
+    for m in history:
+        role, content = m["role"], m.get("content", "")
+        if role == "tool":
+            out.append({"role": "tool", "content": content, "name": m.get("name", "")})
+        elif role == "assistant" and m.get("tool_calls"):
+            out.append({"role": "assistant", "content": content or "", "tool_calls": m["tool_calls"]})
+        else:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _to_openai_msgs(history: list[dict]) -> list[dict]:
+    out = []
+    for m in history:
+        role, content = m["role"], m.get("content", "")
+        if role == "tool":
+            out.append({"role": "tool", "tool_call_id": m.get("tool_call_id", "0"), "content": content})
+        elif role == "assistant" and m.get("tool_calls"):
+            out.append({"role": "assistant", "content": content or None, "tool_calls": m["tool_calls"]})
+        else:
+            out.append({"role": role, "content": content})
+    return out
+
+# ─── Backend: Ollama ──────────────────────────────────────────────────────────
+SYSTEM_OLLAMA = (
+    "You are a helpful terminal agent. Tools available: list_dir, read_file, "
+    "write_file, run_shell, delegate. File access is limited to the current working directory. "
+    "Use tools as needed to complete the user's request."
+)
+
+def chat_ollama(history: list[dict], model: str, think: bool) -> tuple[str, list[dict], float]:
+    """Returns (reply, tool_calls, tok/s)."""
+    try:
+        import ollama as _ollama
+    except ImportError:
+        cprint(RED, "ollama package missing. Activate the venv: source .venv/bin/activate")
+        return "", [], 0.0
+
+    msgs = [{"role": "system", "content": SYSTEM_OLLAMA}] + _to_ollama_msgs(history)
+    options: dict = {"num_ctx": 8192}
+    if think:
+        options["think"] = True
+
+    try:
+        response = _ollama.chat(model=model, messages=msgs, tools=TOOLS, stream=True, options=options)
+    except Exception as exc:
+        cprint(RED, f"Ollama error: {exc}")
+        return "", [], 0.0
+
+    full = ""
+    thinking = ""
+    tool_calls: list[dict] = []
+    eval_count = 0
+    eval_dur_ns = 0
+
+    for chunk in response:
+        msg   = chunk.get("message", {})
+        delta = msg.get("content", "") or ""
+        think_delta = msg.get("thinking", "") or ""
+
+        if think_delta:
+            if not thinking:
+                print(f"\n{DIM}[thinking]", end="", flush=True)
+            print(f"{DIM}{think_delta}{RESET}", end="", flush=True)
+            thinking += think_delta
+
+        if delta:
+            if not full and not thinking:
+                print()
+            print(delta, end="", flush=True)
+            full += delta
+
+        if msg.get("tool_calls"):
+            tool_calls.extend(msg["tool_calls"])
+
+        if chunk.get("done"):
+            eval_count  = chunk.get("eval_count", 0)
+            eval_dur_ns = chunk.get("eval_duration", 0)
+
+    print()
+    tps = eval_count / (eval_dur_ns / 1e9) if eval_dur_ns > 0 else 0.0
+    return full, tool_calls, tps
+
+# ─── Backend: Bonsai (OpenAI-compatible) ─────────────────────────────────────
+SYSTEM_BONSAI = (
+    "You are a helpful terminal agent. Tools: list_dir, read_file, write_file, run_shell, delegate. "
+    "File access is limited to the current working directory. "
+    "Call at most one tool per step. Use exact file paths."
+)
+
+def chat_bonsai(history: list[dict], model: str) -> tuple[str, list[dict], float]:
+    """Returns (reply, tool_calls, tok/s)."""
+    try:
+        import openai as _openai
+    except ImportError:
+        cprint(RED, "openai package missing. Activate the venv: source .venv/bin/activate")
+        return "", [], 0.0
+
+    client = _openai.OpenAI(base_url=BONSAI_BASE, api_key="none")
+    msgs = [{"role": "system", "content": SYSTEM_BONSAI}] + _to_openai_msgs(history)
+
+    try:
+        stream = client.chat.completions.create(
+            model=model, messages=msgs, tools=TOOLS,
+            tool_choice="auto", stream=True,
+            temperature=1.0, top_p=0.95, max_tokens=4096,
+        )
+    except Exception as exc:
+        if "Connection" in str(exc) or "refused" in str(exc):
+            cprint(RED, "Bonsai server is down. Use /backend ollama or restart.")
+        else:
+            cprint(RED, f"Bonsai API error: {exc}")
+        return "", [], 0.0
+
+    full = ""
+    reasoning = ""
+    tc_accum: dict[int, dict] = {}   # index → {id, name, arguments}
+    completion_tokens = 0
+    t0 = time.monotonic()
+
+    for chunk in stream:
+        choice = chunk.choices[0] if chunk.choices else None
+        if not choice:
+            continue
+        delta = choice.delta
+
+        # Reasoning / thinking tokens (shown dimmed)
+        rc = getattr(delta, "reasoning_content", None) or ""
+        if rc:
+            if not reasoning:
+                print(f"\n{DIM}[thinking]", end="", flush=True)
+            print(f"{DIM}{rc}{RESET}", end="", flush=True)
+            reasoning += rc
+
+        # Regular content
+        dc = delta.content or ""
+        if dc:
+            if not full:
+                if reasoning:
+                    print(f"\n{RESET}", end="", flush=True)
+                else:
+                    print()
+            print(dc, end="", flush=True)
+            full += dc
+            completion_tokens += 1
+
+        # Tool-call fragments (assembled by index)
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in tc_accum:
+                    tc_accum[idx] = {"id": "", "name": "", "arguments": ""}
+                if tc.id:
+                    tc_accum[idx]["id"] = tc.id
+                if tc.function:
+                    if tc.function.name:
+                        tc_accum[idx]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        tc_accum[idx]["arguments"] += tc.function.arguments
+
+        if hasattr(chunk, "usage") and chunk.usage:
+            completion_tokens = getattr(chunk.usage, "completion_tokens", completion_tokens) or completion_tokens
+
+    print()
+    elapsed = time.monotonic() - t0
+    tps = completion_tokens / elapsed if elapsed > 0 and completion_tokens > 0 else 0.0
+
+    # Parse accumulated tool calls; bad JSON becomes a tool error at dispatch time
+    tool_calls: list[dict] = []
+    for idx in sorted(tc_accum):
+        raw = tc_accum[idx]
+        args_str = raw["arguments"]
+        parse_err: Optional[str] = None
+        try:
+            json.loads(args_str)
+        except json.JSONDecodeError:
+            parse_err = args_str
+            args_str = "{}"
+
+        tool_calls.append({
+            "id":   raw["id"] or f"call_{idx}",
+            "type": "function",
+            "function": {"name": raw["name"], "arguments": args_str},
+            "_parse_error": parse_err,
+        })
+
+    return full, tool_calls, tps
+
+# ─── Agent loop ───────────────────────────────────────────────────────────────
+MAX_TOOL_ROUNDS = 8
+
+
+class Agent:
+    def __init__(self, backend: str = "ollama"):
+        self.backend = backend
+        self.model: Optional[str] = None
+        self.think  = False
+        self.history: list[dict] = []
+
+    def _default_model(self) -> str:
+        return "qwen3:4b" if self.backend == "ollama" else (bonsai_model_name() or "bonsai-27b")
+
+    def _ensure_model(self) -> None:
+        if self.model is None:
+            self.model = self._default_model()
+
+    def _ensure_bonsai(self) -> bool:
+        if not bonsai_is_up():
+            cprint(CYAN, "Bonsai server not running – auto-starting …")
+            return start_bonsai()
+        return True
+
+    def switch_backend(self, new: str) -> None:
+        if new not in ("ollama", "bonsai"):
+            cprint(RED, "Backend must be 'ollama' or 'bonsai'."); return
+        old = self.backend
+        self.backend = new
+        self.model   = None
+        if old == "bonsai" and new == "ollama":
+            stop_bonsai()
+        cprint(GREEN, f"Backend → {new}  (model will auto-select on next message)")
+
+    def chat(self, user_input: str) -> None:
+        self._ensure_model()
+
+        if self.backend == "bonsai" and not self._ensure_bonsai():
+            cprint(RED, "Cannot connect to Bonsai. Run setup.sh first."); return
+
+        self.history.append(make_msg("user", user_input))
+
+        for tool_round in range(MAX_TOOL_ROUNDS + 1):
+            # Print the backend header on the same line as model reply
+            cprint(BOLD + CYAN, f"\n[{self.backend}:{self.model}]", end=" ")
+            sys.stdout.flush()
+
+            if self.backend == "ollama":
+                reply, raw_tcs, tps = chat_ollama(self.history, self.model, self.think)
+            else:
+                reply, raw_tcs, tps = chat_bonsai(self.history, self.model)
+
+            cprint(DIM, f"  [{tps:.1f} tok/s]")
+
+            # Normalise tool_calls to OpenAI format for storage
+            norm_tcs: list[dict] = []
+            for tc in raw_tcs:
+                if self.backend == "ollama":
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", {})
+                    norm_tcs.append({
+                        "id":   tc.get("id", f"call_{len(norm_tcs)}"),
+                        "type": "function",
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": json.dumps(args) if isinstance(args, dict) else args,
+                        },
+                    })
+                else:
+                    norm_tcs.append(tc)   # already normalised in chat_bonsai
+
+            asst: dict = {"role": "assistant", "content": reply}
+            if norm_tcs:
+                asst["tool_calls"] = norm_tcs
+            self.history.append(asst)
+
+            if not norm_tcs or tool_round >= MAX_TOOL_ROUNDS:
+                if tool_round >= MAX_TOOL_ROUNDS and norm_tcs:
+                    cprint(YELLOW, f"[reached max tool rounds ({MAX_TOOL_ROUNDS})]")
+                break
+
+            cprint(MAGENTA, f"\n[tool round {tool_round + 1}/{MAX_TOOL_ROUNDS}]")
+            for tc in norm_tcs:
+                fn        = tc.get("function", {})
+                name      = fn.get("name", "")
+                raw_args  = fn.get("arguments", "{}")
+                tc_id     = tc.get("id", "0")
+                parse_err = tc.get("_parse_error")
+
+                cprint(MAGENTA,
+                       f"  → {name}({raw_args[:120]}{'…' if len(raw_args) > 120 else ''})")
+
+                if parse_err is not None:
+                    result = f"Tool error: could not parse arguments JSON: {parse_err!r}"
+                else:
+                    result = dispatch_tool(name, raw_args)
+
+                cprint(DIM, f"  ← {result[:300]}{'…' if len(result) > 300 else ''}")
+                self.history.append(make_msg("tool", result, tool_call_id=tc_id, name=name))
+
+    def status(self) -> None:
+        self._ensure_model()
+        print(f"  Backend : {BOLD}{self.backend}{RESET}")
+        print(f"  Model   : {self.model}")
+        print(f"  Think   : {self.think}  (Ollama only)")
+        print(f"  History : {len(self.history)} messages")
+        print(f"  CWD     : {CWD}")
+        if self.backend == "bonsai":
+            up = bonsai_is_up()
+            mn = bonsai_model_name() if up else "—"
+            print(f"  Bonsai  : {'✅ up' if up else '❌ down'}  model={mn}")
+            if _bonsai_proc:
+                print(f"  Bonsai PID (this session): {_bonsai_proc.pid}")
+        else:
+            ok = _http_get("http://127.0.0.1:11434") is not None
+            print(f"  Ollama  : {'✅ up' if ok else '❌ down'}")
+
+# ─── REPL ─────────────────────────────────────────────────────────────────────
+HELP_TEXT = """
+Commands:
+  /backend ollama|bonsai   Switch backend (stops/starts servers as needed)
+  /model <name>            Change active model
+  /think                   Toggle thinking mode (Ollama only)
+  /reset                   Clear conversation history
+  /status                  Show current config + server health
+  /stop                    Stop Bonsai server if started by this script
+  /exit  or  Ctrl-D        Exit
+  /help                    Show this help
+"""
+
+
+def repl(agent: Agent) -> None:
+    cprint(BOLD + GREEN, "Terminal Agent  •  type /help for commands")
+    cprint(DIM, f"Backend: {agent.backend}  •  CWD: {CWD}")
 
     while True:
-        # ---- read user input ----
         try:
-            line = input(f"{cyan('>')} ").strip()
+            line = input(f"\n{BOLD}{GREEN}you>{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            return
+            stop_bonsai()
+            cprint(YELLOW, "Goodbye.")
+            break
 
         if not line:
             continue
 
-        # ---- commands ----
-        if line == "/exit":
-            return
+        if line.startswith("/"):
+            parts = line.split(maxsplit=1)
+            cmd   = parts[0].lower()
+            arg   = parts[1].strip() if len(parts) > 1 else ""
 
-        if line == "/help":
-            print_help()
-            continue
-
-        if line == "/think":
-            think = not think
-            print(f"think={think}")
-            continue
-
-        if line == "/reset":
-            msgs = [{"role": "system", "content": system}]
-            print("history cleared")
-            continue
-
-        if line == "/compress":
-            msgs = compress_context(msgs, model, _CTX)
-            continue
-
-        if line == "/skills":
-            if _LOADED_SKILLS:
-                for n in _LOADED_SKILLS:
-                    print(f"  {n}")
+            if cmd == "/exit":
+                stop_bonsai()
+                cprint(YELLOW, "Goodbye."); break
+            elif cmd == "/help":
+                print(HELP_TEXT)
+            elif cmd == "/reset":
+                agent.history.clear()
+                cprint(GREEN, "History cleared.")
+            elif cmd == "/status":
+                agent.status()
+            elif cmd == "/think":
+                if agent.backend == "ollama":
+                    agent.think = not agent.think
+                    cprint(GREEN, f"Thinking mode {'ON' if agent.think else 'OFF'}.")
+                else:
+                    cprint(YELLOW, "/think only applies to the Ollama backend.")
+            elif cmd == "/stop":
+                stop_bonsai()
+            elif cmd == "/backend":
+                if not arg: cprint(RED, "Usage: /backend ollama|bonsai")
+                else:        agent.switch_backend(arg)
+            elif cmd == "/model":
+                if not arg: cprint(RED, "Usage: /model <name>")
+                else:
+                    agent.model = arg
+                    cprint(GREEN, f"Model → {arg}")
             else:
-                print(dim("no skills loaded (place .md files in ./skills/)"))
-            continue
+                cprint(RED, f"Unknown command '{cmd}'. Type /help.")
+        else:
+            try:
+                agent.chat(line)
+            except KeyboardInterrupt:
+                print()
+                cprint(YELLOW, "[interrupted]")
+            except Exception as exc:
+                cprint(RED, f"Error: {exc}")
+                cprint(DIM, traceback.format_exc())
 
-        if line == "/ctx":
-            used  = msgs_token_count(msgs)
-            ratio = used / _CTX
-            bar   = "█" * int(ratio * 20) + "░" * (20 - int(ratio * 20))
-            print(f"  [{bar}] {used}/{_CTX} tokens ({ratio:.0%})")
-            continue
 
-        if line.startswith("/model "):
-            new_model = line.split(maxsplit=1)[1].strip()
-            if new_model:
-                model = new_model
-                has_tools = supports_tools(model)
-                print(f"model={model}" + ("" if has_tools else dim("  (no tool support)")))
-            continue
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Terminal agent – Ollama + Bonsai")
+    parser.add_argument("--backend", choices=["ollama", "bonsai"], default="ollama")
+    parser.add_argument("--model",   default=None, help="Override model name")
+    args = parser.parse_args()
 
-        # ---- normal message ----
-        msgs.append({"role": "user", "content": line})
-        try:
-            msgs = turn(model, msgs, think, _CTX)
-        except KeyboardInterrupt:
-            print(dim("\n[interrupted]"))
-        except ollama.ResponseError as e:
-            print(red(f"\nOllama error: {e}"))
-            if think:
-                print(dim("Hint: try /think to disable thinking mode"))
-        except MemoryError:
-            print(red("\n[MemoryError] Forcing compression …"))
-            msgs = compress_context(msgs, model, _CTX, keep_last_n=2)
-        except Exception:
-            print(red(f"\n[unexpected error]"))
-            traceback.print_exc()
-            sys.stdout.flush()
+    agent = Agent(backend=args.backend)
+    if args.model:
+        agent.model = args.model
+
+    if args.backend == "bonsai":
+        if not agent._ensure_bonsai():
+            cprint(RED, "Failed to start Bonsai. Run setup.sh first."); sys.exit(1)
+        if agent.model is None:
+            agent.model = bonsai_model_name() or "bonsai-27b"
+
+    repl(agent)
 
 
 if __name__ == "__main__":
