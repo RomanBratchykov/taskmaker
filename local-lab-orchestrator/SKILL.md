@@ -31,6 +31,44 @@ Use this skill when you have a university assignment provided as PDF, DOCX, imag
 - `scripts/prompts/report.md`: Prompt for generating report.
 - `scripts/prompts/validate.md`: Prompt for validating output.
 
+## Environment setup
+
+Before running any scripts, ensure the environment has the required dependencies installed.
+
+**Requirements** (`requires-python = ">=3.10"`):
+
+```toml
+[project]
+name = "local-lab-orchestrator"
+requires-python = ">=3.10"
+dependencies = [
+    "PyMuPDF>=1.24.0",       # fitz — PDF parsing and image extraction (pdf_to_md.py)
+    "python-docx>=1.1.0",    # docx — DOCX read/write (docx_template.py, docx_to_md.py)
+    "requests>=2.31.0",      # HTTP client for Ollama API and file downloads (inspect_models.py, download_input.py)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+```
+
+**Install steps** (run from the `local-lab-orchestrator/` directory):
+
+```bash
+# Standard pip install (editable, includes all runtime deps)
+pip install -e .
+
+# Or install deps directly without the package
+pip install "PyMuPDF>=1.24.0" "python-docx>=1.1.0" "requests>=2.31.0"
+
+# Optional: dev tools
+pip install -e ".[dev]"
+```
+
+> **Note**: If using `hatch`, run `hatch env create` — the default env already includes all runtime dependencies.
+
 ## Input/output conventions
 - Each task uses a workspace directory with the following structure:
   - `input/`: Original input files.

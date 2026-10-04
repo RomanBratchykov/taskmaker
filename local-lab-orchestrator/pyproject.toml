@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-lab-orchestrator"
+version = "0.1.0"
+description = "Local AI lab orchestrator with document processing and model inspection scripts"
+requires-python = ">=3.10"
+dependencies = [
+    "PyMuPDF>=1.24.0",       # fitz — PDF parsing and image extraction (pdf_to_md.py)
+    "python-docx>=1.1.0",    # docx — DOCX read/write (docx_template.py, docx_to_md.py)
+    "requests>=2.31.0",      # HTTP client for Ollama API and file downloads (inspect_models.py, download_input.py)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[tool.hatch.envs.default]
+dependencies = [
+    "PyMuPDF>=1.24.0",
+    "python-docx>=1.1.0",
+    "requests>=2.31.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
